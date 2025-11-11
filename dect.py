@@ -77,6 +77,23 @@ class DeepECT(nn.Module):
         self.nodes = {self.root.id: self.root}
         self.leaf_nodes = [self.root]
 
+    def initialize_tree_from_embeddings(self, latent_vectors: torch.Tensor) -> None:
+        """Initialize the root node center using precomputed latent vectors.
+
+        Args:
+            latent_vectors (torch.Tensor): A tensor of shape (N, latent_dim)
+                containing latent representations used to set the initial
+                cluster center for the root node.
+        """
+        if latent_vectors.ndim != 2 or latent_vectors.size(1) != self.latent_dim:
+            raise ValueError(
+                f"Expected latent vectors with shape (N, {self.latent_dim}), got {tuple(latent_vectors.shape)}"
+            )
+
+        latent_vectors = latent_vectors.to(self.device)
+        with torch.no_grad():
+            self.root.center.data.copy_(latent_vectors.mean(dim=0))
+
     def get_tree_parameters(self) -> list:
         """
         Gathers all learnable parameters (centers of leaf nodes) from the tree.

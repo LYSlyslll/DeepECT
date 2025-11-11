@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from pathlib import Path
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.datasets import make_blobs
 import matplotlib.pyplot as plt
 
@@ -73,6 +73,12 @@ class ClusteringDataset(Dataset):
         return self.data[idx]
 
 dataset = ClusteringDataset(X)
+pretrain_size = int(len(dataset) * 0.9)
+finetune_size = len(dataset) - pretrain_size
+generator = torch.Generator().manual_seed(42)
+pretrain_dataset, _ = random_split(dataset, [pretrain_size, finetune_size], generator=generator)
+
+pretrain_loader = DataLoader(pretrain_dataset, batch_size=256, shuffle=True, num_workers=4)
 dataloader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=4)  # Added multi-threading
 
 fulldataloader = DataLoader(dataset, batch_size=512, shuffle=False)
@@ -84,19 +90,57 @@ INPUT_DIM = X.shape[1]
 LATENT_DIM = 256
 
 embedding_model = Autoencoder(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(DEVICE)
-dect_model = DeepECT(embedding_model=embedding_model, latent_dim=LATENT_DIM, device=DEVICE)
 
 # 5. Learning rate decay setup
 lr = 1e-3
-optimizer = optim.Adam(dect_model.parameters(), lr=lr)
-lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.1)
 
 # 6. Loss function (cosine distance)
 def cosine_distance_loss(x1, x2):
     cos_sim = nn.functional.cosine_similarity(x1, x2, dim=-1)
     return 1 - cos_sim.mean()
 
-# 7. Training loop with loss tracking
+# 7. Autoencoder pretraining on 90% of the data
+pretrain_epochs = 200
+pretrain_optimizer = optim.Adam(embedding_model.parameters(), lr=lr)
+pretrain_losses = []
+
+print("Starting autoencoder pretraining...")
+for epoch in range(pretrain_epochs):
+    embedding_model.train()
+    running_loss = 0.0
+    for batch in pretrain_loader:
+        inputs = batch.to(DEVICE)
+        pretrain_optimizer.zero_grad()
+        _, outputs = embedding_model(inputs)
+        loss = cosine_distance_loss(inputs, outputs)
+        loss.backward()
+        pretrain_optimizer.step()
+        running_loss += loss.item()
+
+    epoch_loss = running_loss / len(pretrain_loader)
+    pretrain_losses.append(epoch_loss)
+    if (epoch + 1) % 50 == 0:
+        print(f"Pretrain Epoch [{epoch + 1}/{pretrain_epochs}], Loss: {epoch_loss:.4f}")
+
+print("Autoencoder pretraining finished.")
+
+# 8. Initialize DeepECT with pretrained embeddings
+embedding_model.eval()
+latent_vectors = []
+with torch.no_grad():
+    for batch in fulldataloader:
+        inputs = batch.to(DEVICE)
+        z, _ = embedding_model(inputs)
+        latent_vectors.append(z.detach().cpu())
+
+latent_vectors = torch.cat(latent_vectors, dim=0)
+dect_model = DeepECT(embedding_model=embedding_model, latent_dim=LATENT_DIM, device=DEVICE)
+dect_model.initialize_tree_from_embeddings(latent_vectors)
+embedding_model.train()
+
+optimizer = optim.Adam(dect_model.parameters(), lr=lr)
+lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.1)
+# 9. Training loop with loss tracking
 losses = []
 print("Starting training...")
 for epoch in range(5000):  # assuming 5000 iterations

@@ -84,6 +84,8 @@ class Autoencoder(nn.Module):
 def load_embeddings_from_jsonl(path: Path):
     embeddings = []
     original_indices = []
+    phrases = []
+    truncated_embeddings = []
     fallback_idx = 0
     with path.open("r", encoding="utf-8") as infile:
         print('reading data...')
@@ -94,8 +96,20 @@ def load_embeddings_from_jsonl(path: Path):
             record = json.loads(stripped)
             if "embedding" not in record:
                 raise KeyError(f"Missing 'embedding' key in {path} at line {line_number}")
-            embeddings.append(record["embedding"])
+            if "phrase" not in record:
+                raise KeyError(f"Missing 'phrase' key in {path} at line {line_number}")
+            embedding_values = record["embedding"]
+            if not isinstance(embedding_values, list):
+                raise TypeError(f"Expected 'embedding' to be a list at line {line_number}")
+            if len(embedding_values) < 768:
+                raise ValueError(
+                    f"Expected embedding length >= 768 (found {len(embedding_values)}) at line {line_number}"
+                )
+            truncated = embedding_values[:768]
+            truncated_embeddings.append(truncated)
+            embeddings.append(truncated)
             original_indices.append(record.get("idx", fallback_idx))
+            phrases.append(record["phrase"])
             fallback_idx += 1
             print(f"{line_number} lines read")
     if not embeddings:
@@ -104,11 +118,11 @@ def load_embeddings_from_jsonl(path: Path):
     if tensor.ndim != 2 or tensor.shape[1] != 768:
         raise ValueError(f"Expected embeddings with shape (N, 768), got {tuple(tensor.shape)}")
     print(f"successfully loaded tensor with shape {tuple(tensor.shape)}")
-    return tensor, original_indices
+    return tensor, original_indices, phrases, truncated_embeddings
 
 # 3. Data preparation
 DATA_PATH = Path("error_types_embeddings.jsonl")
-X, original_indices = load_embeddings_from_jsonl(DATA_PATH)
+X, original_indices, phrases, truncated_embeddings = load_embeddings_from_jsonl(DATA_PATH)
 
 class ClusteringDataset(Dataset):
     def __init__(self, data):
@@ -244,7 +258,7 @@ dect_model.initialize_tree_from_embeddings(latent_vectors)
 embedding_model.train()
 
 print("Starting joint DeepECT training...")
-joint_loss_history = dect_model.train(
+joint_loss_history, leaf_purity_history = dect_model.train(
     dataloader=dataloader,
     iterations=5000,
     lr=lr,
@@ -252,6 +266,7 @@ joint_loss_history = dect_model.train(
     split_interval=2,
     pruning_threshold=0.05,
     split_count_per_growth=3,
+    evaluation_loader=fulldataloader,
 )
 print("Joint training finished.")
 
@@ -269,6 +284,18 @@ plt.legend()
 plt.savefig("training_loss_curve.png")
 plt.show()
 
+# Plotting the leaf purity curve
+if leaf_purity_history:
+    plt.figure()
+    epochs = range(1, len(leaf_purity_history) + 1)
+    plt.plot(epochs, leaf_purity_history, marker='o')
+    plt.xlabel('Epoch')
+    plt.ylabel('Average Leaf Purity')
+    plt.title('Leaf Purity per Epoch')
+    plt.grid(True)
+    plt.savefig("leaf_purity_curve.png")
+    plt.show()
+
 # 9. Model saving and loading
 MODEL_PATH = "dect_model.pth"
 print(f"\nSaving model to {MODEL_PATH}...")
@@ -281,14 +308,17 @@ loaded_dect_model.load_model(MODEL_PATH)
 
 # 10. Predict and Save Results
 assignments = loaded_dect_model.predict(fulldataloader)
-PREDICTIONS_PATH = Path("predictions.jsonl")
+PRED_TEXT_PATH = Path("pred_text.jsonl")
+PRED_EMB_PATH = Path("pred_emb.jsonl")
 assignments_cpu = assignments.detach().cpu().tolist()
 
 if len(assignments_cpu) != len(original_indices):
     raise RuntimeError(f"Length mismatch: assignments={len(assignments_cpu)} vs indices={len(original_indices)}")
 
-with PREDICTIONS_PATH.open("w", encoding="utf-8") as outfile:
-    for idx, cluster_id in zip(original_indices, assignments_cpu):
-        json.dump({"idx": idx, "cluster": int(cluster_id)}, outfile)
-        outfile.write("\n")
-print(f"Predictions saved to {PREDICTIONS_PATH}")
+with PRED_TEXT_PATH.open("w", encoding="utf-8") as text_file, PRED_EMB_PATH.open("w", encoding="utf-8") as emb_file:
+    for idx, phrase, embedding_list, cluster_id in zip(original_indices, phrases, truncated_embeddings, assignments_cpu):
+        json.dump({"idx": idx, "phrase": phrase, "cluster": int(cluster_id)}, text_file)
+        text_file.write("\n")
+        json.dump({"idx": idx, "embedding": embedding_list, "cluster": int(cluster_id)}, emb_file)
+        emb_file.write("\n")
+print(f"Predictions saved to {PRED_TEXT_PATH} and {PRED_EMB_PATH}")

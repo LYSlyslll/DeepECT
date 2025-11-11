@@ -1,14 +1,16 @@
 import collections
+import math
 from tqdm import tqdm
 
 import torch
+import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
 from sklearn.cluster import KMeans
 
-from typing import Union, Tuple, Callable, Iterable, Dict, List, Any
+from typing import Union, Tuple, Callable, Iterable, Dict, List, Any, Optional
 
 
 class TreeNode:
@@ -62,10 +64,10 @@ class DeepECT(nn.Module):
     This model combines a deep embedding model (like an autoencoder) with a dynamically
     growing and pruning binary tree structure for hierarchical clustering.
     """
-    def __init__(self, embedding_model: nn.Module, latent_dim: int, embedding_model_loss: Callable = F.mse_loss, device: torch.device = 'cpu') -> None:
+    def __init__(self, embedding_model: nn.Module, latent_dim: int, embedding_model_loss: Optional[Callable] = None, device: torch.device = 'cpu') -> None:
         super().__init__()
         self.embedding_model = embedding_model.to(device)
-        self.embedding_model_loss = embedding_model_loss
+        self.embedding_model_loss = embedding_model_loss or self.cosine_distance_loss
         self.latent_dim = latent_dim
         self.device = device
 
@@ -76,6 +78,34 @@ class DeepECT(nn.Module):
         # Store nodes in dictionaries and lists for easy access
         self.nodes = {self.root.id: self.root}
         self.leaf_nodes = [self.root]
+
+    @staticmethod
+    def cosine_distance_loss(x1: torch.Tensor, x2: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        x1_norm = F.normalize(x1, p=2, dim=-1, eps=eps)
+        x2_norm = F.normalize(x2, p=2, dim=-1, eps=eps)
+        cos_sim = (x1_norm * x2_norm).sum(dim=-1)
+        cos_distance = 1 - cos_sim
+        return cos_distance.mean()
+
+    def initialize_tree_from_embeddings(self, latent_vectors: torch.Tensor) -> None:
+        """Initialize the root node center using precomputed latent vectors.
+
+        Args:
+            latent_vectors (torch.Tensor): A tensor of shape (N, latent_dim)
+                containing latent representations used to set the initial
+                cluster center for the root node.
+        """
+        if latent_vectors.ndim != 2 or latent_vectors.size(1) != self.latent_dim:
+            raise ValueError(
+                f"Expected latent vectors with shape (N, {self.latent_dim}), got {tuple(latent_vectors.shape)}"
+            )
+
+        latent_vectors = latent_vectors.to(self.device)
+        with torch.no_grad():
+            center = latent_vectors.mean(dim=0)
+            if center.norm(p=2) > 0:
+                center = F.normalize(center, p=2, dim=0)
+            self.root.center.data.copy_(center)
 
     def get_tree_parameters(self) -> list:
         """
@@ -256,7 +286,7 @@ class DeepECT(nn.Module):
 
         # Loss 1: Reconstruction Loss (L_REC)
         # This ensures the embedding retains information from the original data.
-        loss_rec = self.embedding_model_loss(x_hat, x)
+        loss_rec = self.embedding_model_loss(x, x_hat)
         if isinstance(loss_rec, (Tuple, List)):
             loss_rec, *_ = loss_rec
 
@@ -272,8 +302,11 @@ class DeepECT(nn.Module):
         for i, leaf in enumerate(self.leaf_nodes):
             assigned_indices = (leaf_assignments == i).nonzero(as_tuple=True)[0]
             if len(assigned_indices) > 0:
-                mean_z = z[assigned_indices].mean(dim=0).detach() 
-                loss_nc += F.mse_loss(leaf.center, mean_z)
+                mean_z = z[assigned_indices].mean(dim=0).detach()
+                loss_nc += self.cosine_distance_loss(
+                    leaf.center.unsqueeze(0),
+                    mean_z.unsqueeze(0)
+                )
                 num_leaves_with_data += 1
         if num_leaves_with_data > 0:
             loss_nc /= num_leaves_with_data
@@ -316,10 +349,12 @@ class DeepECT(nn.Module):
             if node.id in points_assigned_to_internal_nodes and node.id in projection_vectors:
                 assigned_z_for_node = z[points_assigned_to_internal_nodes[node.id]]
                 projection_vector = projection_vectors[node.id]
-                
-                # Project the difference vector onto the separation vector
-                projected_dist = (assigned_z_for_node - node.center.detach()) @ projection_vector
-                loss_dc += torch.abs(projected_dist).mean()
+
+                diff = assigned_z_for_node - node.center.detach()
+                diff_norm = F.normalize(diff, p=2, dim=-1)
+                proj_norm = F.normalize(projection_vector, p=2, dim=0)
+                cos_alignment = (diff_norm * proj_norm).sum(dim=-1)
+                loss_dc += (1 - torch.abs(cos_alignment)).mean()
                 num_nodes_for_dc += 1
         if num_nodes_for_dc > 0:
             loss_dc /= num_nodes_for_dc
@@ -351,18 +386,38 @@ class DeepECT(nn.Module):
         """
         # Helper to re-create the optimizer when tree structure changes
         def create_optimizer(tree_params):
+            params = [{'params': self.embedding_model.parameters(), 'weight_decay': 0.01}]
             if tree_params:
-                return optim.Adam([
-                    {'params': self.embedding_model.parameters()},
-                    {'params': tree_params}
-                ], lr=lr)
-            else:
-                return optim.Adam(self.embedding_model.parameters(), lr=lr)
+                params.append({'params': tree_params, 'weight_decay': 0.0})
+            return optim.AdamW(params, lr=lr, betas=(0.9, 0.95))
+
+        def create_scheduler(optimizer, last_step=-1):
+            total_steps = max(1, iterations)
+            warmup_steps = min(5000, total_steps)
+
+            def lr_lambda(step: int) -> float:
+                current_step = step + 1
+                if current_step <= warmup_steps and warmup_steps > 0:
+                    return current_step / float(max(1, warmup_steps))
+                if total_steps == warmup_steps:
+                    return 1.0
+                progress = (current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                progress = min(max(progress, 0.0), 1.0)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_step)
 
         optimizer = create_optimizer(self.get_tree_parameters())
-        bar = tqdm(range(iterations))
+        scheduler = create_scheduler(optimizer)
+        optimizer.zero_grad(set_to_none=True)
+        bar = tqdm(total=iterations)
         data_iterator = iter(dataloader)
         iteration = 0
+        scaler = amp.GradScaler(enabled=self.device.type == 'cuda')
+        accumulation_steps = None
+        loss_history: List[float] = []
+        pending_losses = {'loss': 0.0, 'rec': 0.0, 'nc': 0.0, 'dc': 0.0}
+        micro_step = 0
 
         while iteration < iterations:
             try:
@@ -387,23 +442,54 @@ class DeepECT(nn.Module):
             # If tree structure changed, we need a new optimizer for the new set of parameters
             if structure_changed:
                 optimizer = create_optimizer(self.get_tree_parameters())
+                scheduler = create_scheduler(optimizer, last_step=iteration - 1)
+                optimizer.zero_grad(set_to_none=True)
+                scaler = amp.GradScaler(enabled=self.device.type == 'cuda')
 
-            # Standard training step
-            optimizer.zero_grad()
-            loss, l_rec, l_nc, l_dc = self(data)
-            loss.backward()
-            optimizer.step()
-            
-            # Update progress bar
-            bar.update(1)
-            bar.set_description(
-                f'Iter {iteration} | '
-                f'Loss: {loss.item():.3f} | '
-                f'Rec: {l_rec.item():.3f} | NC: {l_nc.item():.3f} | DC: {l_dc.item():.3f} | '
-                f'Leaves: {len(self.leaf_nodes)}'
-            )
-            iteration += 1
-    
+            if accumulation_steps is None:
+                desired_global_batch = 4096 if self.device.type == 'cuda' else max(data.size(0), 1024)
+                accumulation_steps = max(1, desired_global_batch // data.size(0))
+
+            with amp.autocast(enabled=self.device.type == 'cuda'):
+                loss, l_rec, l_nc, l_dc = self(data)
+
+            pending_losses['loss'] = loss.detach().item()
+            pending_losses['rec'] = l_rec.detach().item()
+            pending_losses['nc'] = l_nc.detach().item()
+            pending_losses['dc'] = l_dc.detach().item()
+
+            scaled_loss = loss / accumulation_steps
+            scaler.scale(scaled_loss).backward()
+            micro_step += 1
+
+            should_step = (micro_step % accumulation_steps == 0) or (iteration + 1 == iterations)
+            if should_step:
+                scaler.unscale_(optimizer)
+                trainable_params = [
+                    p for group in optimizer.param_groups for p in group['params'] if p.requires_grad
+                ]
+                if trainable_params:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+
+                loss_history.append(pending_losses['loss'])
+
+                bar.update(1)
+                bar.set_description(
+                    f'Iter {iteration} | '
+                    f'Loss: {pending_losses["loss"]:.3f} | '
+                    f'Rec: {pending_losses["rec"]:.3f} | NC: {pending_losses["nc"]:.3f} | '
+                    f'DC: {pending_losses["dc"]:.3f} | '
+                    f'Leaves: {len(self.leaf_nodes)}'
+                )
+                iteration += 1
+
+        
+        bar.close()
+        return loss_history
     def predict(self, data_loader: Iterable) -> torch.Tensor:
         """
         Assigns each data point from the data loader to a cluster (leaf node).

@@ -365,7 +365,7 @@ class DeepECT(nn.Module):
         with torch.no_grad():
             for i, leaf in enumerate(self.leaf_nodes):
                 num_assigned = (leaf_assignments == i).sum().float() / len(leaf_assignments)
-                leaf.update_weight(num_assigned)
+                leaf.update_weight(num_assigned, alpha=phase_params['weight_alpha'])
             self._update_inner_node_centers()
 
         return total_loss, loss_rec, loss_nc, loss_dc
@@ -459,31 +459,54 @@ class DeepECT(nn.Module):
         batches_seen_in_epoch = 0
         epoch_purities: List[float] = []
         purity_loader = evaluation_loader if evaluation_loader is not None else dataloader
+        aggressive_ratio = 0.6
+        aggressive_phase_iters = max(1, int(iterations * aggressive_ratio))
+
+        def get_phase_params(current_iteration: int) -> Dict[str, Any]:
+            if current_iteration < aggressive_phase_iters:
+                return {
+                    'split_interval': 1,
+                    'split_count': 0.25,
+                    'pruning_threshold': 0.0,
+                    'enable_pruning': False,
+                    'enable_evaluation': False,
+                    'weight_alpha': 0.05,
+                }
+            return {
+                'split_interval': split_interval,
+                'split_count': split_count_per_growth,
+                'pruning_threshold': pruning_threshold,
+                'enable_pruning': True,
+                'enable_evaluation': True,
+                'weight_alpha': 0.05,
+            }
+
+        active_purity_loader = purity_loader
 
         while iteration < iterations:
+            phase_params = get_phase_params(iteration)
             try:
                 data = next(data_iterator)
             except StopIteration:
-                if batches_per_epoch is not None and batches_seen_in_epoch == batches_per_epoch:
-                    epoch_purity = self._compute_leaf_purity(purity_loader)
+                if batches_per_epoch is not None and batches_seen_in_epoch == batches_per_epoch and phase_params['enable_evaluation']:
+                    epoch_purity = self._compute_leaf_purity(active_purity_loader)
                     epoch_purities.append(epoch_purity)
                 data_iterator = iter(dataloader)
                 data = next(data_iterator)
-                
+
             batches_seen_in_epoch = 0 if batches_per_epoch is not None and batches_seen_in_epoch == batches_per_epoch else batches_seen_in_epoch
             batches_seen_in_epoch += 1
-
             super().train()
             data = data.to(self.device)
             structure_changed = False
 
             # Prune the tree to remove inactive nodes
-            if self._prune_tree(threshold=pruning_threshold):
+            if phase_params['enable_pruning'] and self._prune_tree(threshold=phase_params['pruning_threshold']):
                 structure_changed = True
 
             # Grow the tree by splitting high-variance nodes
-            if iteration > 0 and iteration % split_interval == 0 and len(self.leaf_nodes) < max_leaves:
-                if self._grow_tree(dataloader, max_leaves=max_leaves, split_count=split_count_per_growth):
+            if iteration > 0 and iteration % phase_params['split_interval'] == 0 and len(self.leaf_nodes) < max_leaves:
+                if self._grow_tree(dataloader, max_leaves=max_leaves, split_count=phase_params['split_count']):
                     structure_changed = True
 
             # If tree structure changed, we need a new optimizer for the new set of parameters
@@ -537,8 +560,10 @@ class DeepECT(nn.Module):
 
         bar.close()
         if batches_per_epoch is not None and batches_seen_in_epoch > 0:
-            epoch_purity = self._compute_leaf_purity(purity_loader)
-            epoch_purities.append(epoch_purity)
+            final_phase_params = get_phase_params(iteration)
+            if final_phase_params['enable_evaluation']:
+                epoch_purity = self._compute_leaf_purity(active_purity_loader)
+                epoch_purities.append(epoch_purity)
 
         return loss_history, epoch_purities
     def predict(self, data_loader: Iterable) -> torch.Tensor:

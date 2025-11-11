@@ -263,9 +263,9 @@ joint_loss_history, leaf_purity_history = dect_model.train(
     iterations=5000,
     lr=lr,
     max_leaves=3000,
-    split_interval=2,
-    pruning_threshold=0.05,
-    split_count_per_growth=3,
+    split_interval=10,
+    pruning_threshold=0.02,
+    split_count_per_growth=5,
     evaluation_loader=fulldataloader,
 )
 print("Joint training finished.")

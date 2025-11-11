@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from sklearn.cluster import KMeans
 
-from typing import Union, Tuple, Callable, Iterable, Dict, List, Any
+from typing import Union, Tuple, Callable, Iterable, Dict, List, Any, Optional
 
 
 class TreeNode:
@@ -64,10 +64,10 @@ class DeepECT(nn.Module):
     This model combines a deep embedding model (like an autoencoder) with a dynamically
     growing and pruning binary tree structure for hierarchical clustering.
     """
-    def __init__(self, embedding_model: nn.Module, latent_dim: int, embedding_model_loss: Callable = F.mse_loss, device: torch.device = 'cpu') -> None:
+    def __init__(self, embedding_model: nn.Module, latent_dim: int, embedding_model_loss: Optional[Callable] = None, device: torch.device = 'cpu') -> None:
         super().__init__()
         self.embedding_model = embedding_model.to(device)
-        self.embedding_model_loss = embedding_model_loss
+        self.embedding_model_loss = embedding_model_loss or self.cosine_distance_loss
         self.latent_dim = latent_dim
         self.device = device
 
@@ -78,6 +78,14 @@ class DeepECT(nn.Module):
         # Store nodes in dictionaries and lists for easy access
         self.nodes = {self.root.id: self.root}
         self.leaf_nodes = [self.root]
+
+    @staticmethod
+    def cosine_distance_loss(x1: torch.Tensor, x2: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        x1_norm = F.normalize(x1, p=2, dim=-1, eps=eps)
+        x2_norm = F.normalize(x2, p=2, dim=-1, eps=eps)
+        cos_sim = (x1_norm * x2_norm).sum(dim=-1)
+        cos_distance = 1 - cos_sim
+        return cos_distance.mean()
 
     def initialize_tree_from_embeddings(self, latent_vectors: torch.Tensor) -> None:
         """Initialize the root node center using precomputed latent vectors.
@@ -278,7 +286,7 @@ class DeepECT(nn.Module):
 
         # Loss 1: Reconstruction Loss (L_REC)
         # This ensures the embedding retains information from the original data.
-        loss_rec = self.embedding_model_loss(x_hat, x)
+        loss_rec = self.embedding_model_loss(x, x_hat)
         if isinstance(loss_rec, (Tuple, List)):
             loss_rec, *_ = loss_rec
 
@@ -294,8 +302,11 @@ class DeepECT(nn.Module):
         for i, leaf in enumerate(self.leaf_nodes):
             assigned_indices = (leaf_assignments == i).nonzero(as_tuple=True)[0]
             if len(assigned_indices) > 0:
-                mean_z = z[assigned_indices].mean(dim=0).detach() 
-                loss_nc += F.mse_loss(leaf.center, mean_z)
+                mean_z = z[assigned_indices].mean(dim=0).detach()
+                loss_nc += self.cosine_distance_loss(
+                    leaf.center.unsqueeze(0),
+                    mean_z.unsqueeze(0)
+                )
                 num_leaves_with_data += 1
         if num_leaves_with_data > 0:
             loss_nc /= num_leaves_with_data
@@ -338,10 +349,12 @@ class DeepECT(nn.Module):
             if node.id in points_assigned_to_internal_nodes and node.id in projection_vectors:
                 assigned_z_for_node = z[points_assigned_to_internal_nodes[node.id]]
                 projection_vector = projection_vectors[node.id]
-                
-                # Project the difference vector onto the separation vector
-                projected_dist = (assigned_z_for_node - node.center.detach()) @ projection_vector
-                loss_dc += torch.abs(projected_dist).mean()
+
+                diff = assigned_z_for_node - node.center.detach()
+                diff_norm = F.normalize(diff, p=2, dim=-1)
+                proj_norm = F.normalize(projection_vector, p=2, dim=0)
+                cos_alignment = (diff_norm * proj_norm).sum(dim=-1)
+                loss_dc += (1 - torch.abs(cos_alignment)).mean()
                 num_nodes_for_dc += 1
         if num_nodes_for_dc > 0:
             loss_dc /= num_nodes_for_dc

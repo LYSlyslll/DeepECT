@@ -119,7 +119,7 @@ class ClusteringDataset(Dataset):
         return self.data[idx]
 
 dataset = ClusteringDataset(X)
-pretrain_size = max(1, int(len(dataset) * 0.9))
+pretrain_size = max(1, int(len(dataset) * 0.4))
 finetune_size = max(0, len(dataset) - pretrain_size)
 generator = torch.Generator().manual_seed(42)
 pretrain_dataset, _ = random_split(dataset, [pretrain_size, finetune_size], generator=generator)
@@ -163,7 +163,7 @@ def build_cosine_with_warmup_scheduler(optimizer: optim.Optimizer, total_steps: 
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_step)
 
 
-# Autoencoder pretraining on 90% of the data
+# Autoencoder pretraining on 40% of the data
 use_amp = DEVICE.type == "cuda"
 scaler = amp.GradScaler(enabled=use_amp)
 pretrain_optimizer = optim.AdamW(

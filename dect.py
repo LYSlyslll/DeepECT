@@ -370,8 +370,44 @@ class DeepECT(nn.Module):
 
         return total_loss, loss_rec, loss_nc, loss_dc
 
-    def train(self, dataloader: Iterable, iterations: int, lr: float, max_leaves: int, split_interval: int, 
-              pruning_threshold: float, split_count_per_growth: Union[int, float] = 1):
+    def _compute_leaf_purity(self, dataloader: Iterable) -> float:
+        was_training = self.embedding_model.training
+        self.embedding_model.eval()
+        all_z: List[torch.Tensor] = []
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = batch.to(self.device)
+                z, _ = self.embedding_model(batch)
+                all_z.append(z)
+
+        if not all_z:
+            if was_training:
+                self.embedding_model.train()
+            return 0.0
+
+        all_z_tensor = torch.cat(all_z, dim=0)
+        assignments = self._find_closest_leaf(all_z_tensor)
+        leaf_purities: List[float] = []
+        for i, leaf in enumerate(self.leaf_nodes):
+            assigned_indices = (assignments == i).nonzero(as_tuple=True)[0]
+            if assigned_indices.numel() == 0:
+                continue
+            assigned_z = all_z_tensor[assigned_indices]
+            normalized_leaf_center = F.normalize(leaf.center.unsqueeze(0), p=2, dim=-1)
+            normalized_assigned = F.normalize(assigned_z, p=2, dim=-1)
+            similarities = torch.sum(normalized_assigned * normalized_leaf_center, dim=1)
+            leaf_purities.append(similarities.mean().item())
+
+        if was_training:
+            self.embedding_model.train()
+
+        if not leaf_purities:
+            return 0.0
+        return float(sum(leaf_purities) / len(leaf_purities))
+
+    def train(self, dataloader: Iterable, iterations: int, lr: float, max_leaves: int, split_interval: int,
+              pruning_threshold: float, split_count_per_growth: Union[int, float] = 1,
+              evaluation_loader: Union[Iterable, None] = None):
         """
         The main training loop for the DeepECT model.
 
@@ -383,6 +419,7 @@ class DeepECT(nn.Module):
             split_interval (int): The number of iterations between tree growing procedures.
             pruning_threshold (float): The weight threshold for pruning dead nodes.
             split_count_per_growth (int or float): The number or fraction of nodes to split during each growth phase.
+            evaluation_loader (Iterable, optional): Data loader used to evaluate leaf purity each epoch.
         """
         # Helper to re-create the optimizer when tree structure changes
         def create_optimizer(tree_params):
@@ -418,13 +455,23 @@ class DeepECT(nn.Module):
         loss_history: List[float] = []
         pending_losses = {'loss': 0.0, 'rec': 0.0, 'nc': 0.0, 'dc': 0.0}
         micro_step = 0
+        batches_per_epoch = len(dataloader) if hasattr(dataloader, '__len__') else None
+        batches_seen_in_epoch = 0
+        epoch_purities: List[float] = []
+        purity_loader = evaluation_loader if evaluation_loader is not None else dataloader
 
         while iteration < iterations:
             try:
                 data = next(data_iterator)
             except StopIteration:
+                if batches_per_epoch is not None and batches_seen_in_epoch == batches_per_epoch:
+                    epoch_purity = self._compute_leaf_purity(purity_loader)
+                    epoch_purities.append(epoch_purity)
                 data_iterator = iter(dataloader)
                 data = next(data_iterator)
+                
+            batches_seen_in_epoch = 0 if batches_per_epoch is not None and batches_seen_in_epoch == batches_per_epoch else batches_seen_in_epoch
+            batches_seen_in_epoch += 1
 
             super().train()
             data = data.to(self.device)
@@ -487,9 +534,13 @@ class DeepECT(nn.Module):
                 )
                 iteration += 1
 
-        
+
         bar.close()
-        return loss_history
+        if batches_per_epoch is not None and batches_seen_in_epoch > 0:
+            epoch_purity = self._compute_leaf_purity(purity_loader)
+            epoch_purities.append(epoch_purity)
+
+        return loss_history, epoch_purities
     def predict(self, data_loader: Iterable) -> torch.Tensor:
         """
         Assigns each data point from the data loader to a cluster (leaf node).

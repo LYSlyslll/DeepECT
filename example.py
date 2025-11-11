@@ -1,8 +1,11 @@
 import json
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
+from torch.cuda import amp
 from torch.utils.data import Dataset, DataLoader, random_split
 from sklearn.datasets import make_blobs
 import matplotlib.pyplot as plt
@@ -10,28 +13,71 @@ import matplotlib.pyplot as plt
 # Assuming dect.py is in the same directory
 from dect import DeepECT
 
-# 1. Modify the Autoencoder structure (two hidden layers, LeakyReLU)
-class Autoencoder(nn.Module):
-    def __init__(self, input_dim, latent_dim):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.LeakyReLU(0.2),
-            nn.Linear(512, 256),
-            nn.LeakyReLU(0.2),
-            nn.Linear(256, latent_dim)
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.LeakyReLU(0.2),
-            nn.Linear(256, 512),
-            nn.LeakyReLU(0.2),
-            nn.Linear(512, input_dim)
-        )
 
-    def forward(self, x):
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
+class ResidualBlock(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.linear1 = nn.Linear(dim, dim)
+        self.activation = nn.GELU()
+        self.linear2 = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.linear2(self.activation(self.linear1(x)))
+        return self.norm(x + residual)
+
+
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim: int, latent_dim: int, noise_std: float = 0.05) -> None:
+        super().__init__()
+        self.noise_std = noise_std
+
+        self.input_norm = nn.LayerNorm(input_dim)
+
+        self.enc_fc1 = nn.Linear(input_dim, 512)
+        self.enc_act1 = nn.GELU()
+        self.enc_dropout1 = nn.Dropout(0.1)
+        self.enc_res1 = ResidualBlock(512)
+
+        self.enc_fc2 = nn.Linear(512, 256)
+        self.enc_act2 = nn.GELU()
+        self.enc_dropout2 = nn.Dropout(0.1)
+        self.enc_res2 = ResidualBlock(256)
+
+        self.enc_latent = nn.Linear(256, latent_dim)
+
+        self.dec_fc1 = nn.Linear(latent_dim, 256)
+        self.dec_act1 = nn.GELU()
+        self.dec_res1 = ResidualBlock(256)
+        self.dec_dropout1 = nn.Dropout(0.1)
+
+        self.dec_fc2 = nn.Linear(256, 512)
+        self.dec_act2 = nn.GELU()
+        self.dec_res2 = ResidualBlock(512)
+
+        self.dec_out = nn.Linear(512, input_dim)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(x) * self.noise_std
+            x_noisy = x + noise
+        else:
+            x_noisy = x
+
+        h = self.input_norm(x_noisy)
+        h = self.enc_dropout1(self.enc_act1(self.enc_fc1(h)))
+        h = self.enc_res1(h)
+        h = self.enc_dropout2(self.enc_act2(self.enc_fc2(h)))
+        h = self.enc_res2(h)
+        z = self.enc_latent(h)
+        z = F.normalize(z, p=2, dim=-1)
+
+        h = self.dec_act1(self.dec_fc1(z))
+        h = self.dec_res1(h)
+        h = self.dec_dropout1(h)
+        h = self.dec_act2(self.dec_fc2(h))
+        h = self.dec_res2(h)
+        x_hat = self.dec_out(h)
         return z, x_hat
 
 # 2. Load embeddings from JSONL
@@ -73,109 +119,153 @@ class ClusteringDataset(Dataset):
         return self.data[idx]
 
 dataset = ClusteringDataset(X)
-pretrain_size = int(len(dataset) * 0.9)
-finetune_size = len(dataset) - pretrain_size
+pretrain_size = max(1, int(len(dataset) * 0.9))
+finetune_size = max(0, len(dataset) - pretrain_size)
 generator = torch.Generator().manual_seed(42)
 pretrain_dataset, _ = random_split(dataset, [pretrain_size, finetune_size], generator=generator)
 
-pretrain_loader = DataLoader(pretrain_dataset, batch_size=256, shuffle=True, num_workers=4)
-dataloader = DataLoader(dataset, batch_size=256, shuffle=True, num_workers=4)  # Added multi-threading
-
-fulldataloader = DataLoader(dataset, batch_size=512, shuffle=False)
-
-# 4. Multi-GPU training setup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pin_memory = DEVICE.type == "cuda"
 print(DEVICE)
 INPUT_DIM = X.shape[1]
-LATENT_DIM = 256
+LATENT_DIM = 128
+
+micro_batch_size = min(1024, max(1, len(dataset)))
+pretrain_loader = DataLoader(pretrain_dataset, batch_size=micro_batch_size, shuffle=True, num_workers=4, pin_memory=pin_memory)
+dataloader = DataLoader(dataset, batch_size=micro_batch_size, shuffle=True, num_workers=4, pin_memory=pin_memory)
+fulldataloader = DataLoader(dataset, batch_size=2048, shuffle=False, num_workers=4, pin_memory=pin_memory)
 
 embedding_model = Autoencoder(input_dim=INPUT_DIM, latent_dim=LATENT_DIM).to(DEVICE)
 
-# 5. Learning rate decay setup
 lr = 1e-3
 
-# 6. Loss function (cosine distance)
-def cosine_distance_loss(x1, x2):
-    cos_sim = nn.functional.cosine_similarity(x1, x2, dim=-1)
+
+def cosine_distance_loss(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+    cos_sim = F.cosine_similarity(x1, x2, dim=-1)
     return 1 - cos_sim.mean()
 
-# 7. Autoencoder pretraining on 90% of the data
-pretrain_epochs = 200
-pretrain_optimizer = optim.Adam(embedding_model.parameters(), lr=lr)
+
+def build_cosine_with_warmup_scheduler(optimizer: optim.Optimizer, total_steps: int, warmup_steps: int = 5000, last_step: int = -1):
+    warmup_steps = min(warmup_steps, total_steps)
+
+    def lr_lambda(step: int) -> float:
+        step_index = step + 1
+        if total_steps <= 0:
+            return 1.0
+        if step_index <= warmup_steps and warmup_steps > 0:
+            return float(step_index) / float(max(1, warmup_steps))
+        if total_steps == warmup_steps:
+            return 1.0
+        progress = (step_index - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_step)
+
+
+# Autoencoder pretraining on 90% of the data
+use_amp = DEVICE.type == "cuda"
+scaler = amp.GradScaler(enabled=use_amp)
+pretrain_optimizer = optim.AdamW(
+    embedding_model.parameters(),
+    lr=lr,
+    betas=(0.9, 0.95),
+    weight_decay=0.01,
+)
+pretrain_optimizer.zero_grad(set_to_none=True)
+
+accumulation_steps = None
+total_pretrain_steps = None
+pretrain_scheduler = None
+pretrain_epochs = 3
 pretrain_losses = []
 
 print("Starting autoencoder pretraining...")
 for epoch in range(pretrain_epochs):
     embedding_model.train()
     running_loss = 0.0
-    for batch in pretrain_loader:
-        inputs = batch.to(DEVICE)
-        pretrain_optimizer.zero_grad()
-        _, outputs = embedding_model(inputs)
-        loss = cosine_distance_loss(inputs, outputs)
-        loss.backward()
-        pretrain_optimizer.step()
+    completed_steps = 0
+    for batch_idx, batch in enumerate(pretrain_loader):
+        inputs = batch.to(DEVICE, non_blocking=pin_memory)
+
+        if accumulation_steps is None:
+            desired_global_batch = 4096 if use_amp else max(inputs.size(0), 1024)
+            accumulation_steps = max(1, desired_global_batch // inputs.size(0))
+            total_pretrain_steps = math.ceil(len(pretrain_loader) / accumulation_steps) * pretrain_epochs
+            pretrain_scheduler = build_cosine_with_warmup_scheduler(
+                pretrain_optimizer,
+                total_steps=total_pretrain_steps,
+                warmup_steps=5000,
+            )
+
+        with amp.autocast(enabled=use_amp):
+            _, outputs = embedding_model(inputs)
+            loss = cosine_distance_loss(inputs, outputs)
+
+        scaled_loss = loss / accumulation_steps
+        scaler.scale(scaled_loss).backward()
+
+        should_step = ((batch_idx + 1) % accumulation_steps == 0) or (batch_idx + 1 == len(pretrain_loader))
+        if should_step:
+            scaler.unscale_(pretrain_optimizer)
+            torch.nn.utils.clip_grad_norm_(embedding_model.parameters(), 1.0)
+            scaler.step(pretrain_optimizer)
+            scaler.update()
+            pretrain_optimizer.zero_grad(set_to_none=True)
+            if pretrain_scheduler is not None:
+                pretrain_scheduler.step()
+            completed_steps += 1
+
         running_loss += loss.item()
 
-    epoch_loss = running_loss / len(pretrain_loader)
+    epoch_loss = running_loss / max(1, completed_steps)
     pretrain_losses.append(epoch_loss)
-    if (epoch + 1) % 50 == 0:
-        print(f"Pretrain Epoch [{epoch + 1}/{pretrain_epochs}], Loss: {epoch_loss:.4f}")
+    print(f"Pretrain Epoch [{epoch + 1}/{pretrain_epochs}], Loss: {epoch_loss:.4f}")
 
 print("Autoencoder pretraining finished.")
 
-# 8. Initialize DeepECT with pretrained embeddings
+# Initialize DeepECT with pretrained embeddings
 embedding_model.eval()
 latent_vectors = []
 with torch.no_grad():
     for batch in fulldataloader:
-        inputs = batch.to(DEVICE)
+        inputs = batch.to(DEVICE, non_blocking=pin_memory)
         z, _ = embedding_model(inputs)
         latent_vectors.append(z.detach().cpu())
 
 latent_vectors = torch.cat(latent_vectors, dim=0)
-dect_model = DeepECT(embedding_model=embedding_model, latent_dim=LATENT_DIM, device=DEVICE)
+dect_model = DeepECT(
+    embedding_model=embedding_model,
+    latent_dim=LATENT_DIM,
+    embedding_model_loss=cosine_distance_loss,
+    device=DEVICE,
+)
 dect_model.initialize_tree_from_embeddings(latent_vectors)
 embedding_model.train()
 
-optimizer = optim.Adam(dect_model.parameters(), lr=lr)
-lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1000, gamma=0.1)
-# 9. Training loop with loss tracking
-losses = []
-print("Starting training...")
-for epoch in range(5000):  # assuming 5000 iterations
-    dect_model.train(
-        dataloader=dataloader,
-        iterations=5000,
-        max_leaves=3000,          # Stop growing when the tree has 10 leaves
-        lr = lr,
-        split_interval=2,     # Check for splits every 200 iterations
-        pruning_threshold=0.05, # Prune nodes with weight < 0.05
-        split_count_per_growth=3 # Split the 2 best candidate nodes each time
-    )
-    running_loss = 0.0
-    for i, data in enumerate(dataloader, 0):
-        inputs = data.to(DEVICE)
-        optimizer.zero_grad()
-        _, outputs = dect_model.embedding_model(inputs)
-        loss = cosine_distance_loss(inputs, outputs)  # use cosine distance loss
-        loss.backward()
-        optimizer.step()
+print("Starting joint DeepECT training...")
+joint_loss_history = dect_model.train(
+    dataloader=dataloader,
+    iterations=5000,
+    lr=lr,
+    max_leaves=3000,
+    split_interval=2,
+    pruning_threshold=0.05,
+    split_count_per_growth=3,
+)
+print("Joint training finished.")
 
-        running_loss += loss.item()
-    losses.append(running_loss / len(dataloader))
-    lr_scheduler.step()  # apply learning rate decay
-
-    if epoch % 500 == 0:
-        print(f"Epoch [{epoch+1}/5000], Loss: {running_loss / len(dataloader):.4f}")
-
-print("Training finished.")
-
-# 8. Plotting the loss curve
-plt.plot(losses)
-plt.xlabel('Epoch')
+# Plotting the loss curve
+plt.figure()
+plt.plot(range(1, len(pretrain_losses) + 1), pretrain_losses, label="Pretraining (epoch avg)")
+if joint_loss_history:
+    offset = len(pretrain_losses)
+    joint_steps = [offset + step + 1 for step in range(len(joint_loss_history))]
+    plt.plot(joint_steps, joint_loss_history, label="Joint training (per step)")
+plt.xlabel('Step')
 plt.ylabel('Loss')
 plt.title('Training Loss Curve')
+plt.legend()
 plt.savefig("training_loss_curve.png")
 plt.show()
 

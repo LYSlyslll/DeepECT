@@ -1,7 +1,9 @@
 import collections
+import math
 from tqdm import tqdm
 
 import torch
+import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
@@ -92,7 +94,10 @@ class DeepECT(nn.Module):
 
         latent_vectors = latent_vectors.to(self.device)
         with torch.no_grad():
-            self.root.center.data.copy_(latent_vectors.mean(dim=0))
+            center = latent_vectors.mean(dim=0)
+            if center.norm(p=2) > 0:
+                center = F.normalize(center, p=2, dim=0)
+            self.root.center.data.copy_(center)
 
     def get_tree_parameters(self) -> list:
         """
@@ -368,18 +373,38 @@ class DeepECT(nn.Module):
         """
         # Helper to re-create the optimizer when tree structure changes
         def create_optimizer(tree_params):
+            params = [{'params': self.embedding_model.parameters(), 'weight_decay': 0.01}]
             if tree_params:
-                return optim.Adam([
-                    {'params': self.embedding_model.parameters()},
-                    {'params': tree_params}
-                ], lr=lr)
-            else:
-                return optim.Adam(self.embedding_model.parameters(), lr=lr)
+                params.append({'params': tree_params, 'weight_decay': 0.0})
+            return optim.AdamW(params, lr=lr, betas=(0.9, 0.95))
+
+        def create_scheduler(optimizer, last_step=-1):
+            total_steps = max(1, iterations)
+            warmup_steps = min(5000, total_steps)
+
+            def lr_lambda(step: int) -> float:
+                current_step = step + 1
+                if current_step <= warmup_steps and warmup_steps > 0:
+                    return current_step / float(max(1, warmup_steps))
+                if total_steps == warmup_steps:
+                    return 1.0
+                progress = (current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+                progress = min(max(progress, 0.0), 1.0)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=last_step)
 
         optimizer = create_optimizer(self.get_tree_parameters())
-        bar = tqdm(range(iterations))
+        scheduler = create_scheduler(optimizer)
+        optimizer.zero_grad(set_to_none=True)
+        bar = tqdm(total=iterations)
         data_iterator = iter(dataloader)
         iteration = 0
+        scaler = amp.GradScaler(enabled=self.device.type == 'cuda')
+        accumulation_steps = None
+        loss_history: List[float] = []
+        pending_losses = {'loss': 0.0, 'rec': 0.0, 'nc': 0.0, 'dc': 0.0}
+        micro_step = 0
 
         while iteration < iterations:
             try:
@@ -404,23 +429,54 @@ class DeepECT(nn.Module):
             # If tree structure changed, we need a new optimizer for the new set of parameters
             if structure_changed:
                 optimizer = create_optimizer(self.get_tree_parameters())
+                scheduler = create_scheduler(optimizer, last_step=iteration - 1)
+                optimizer.zero_grad(set_to_none=True)
+                scaler = amp.GradScaler(enabled=self.device.type == 'cuda')
 
-            # Standard training step
-            optimizer.zero_grad()
-            loss, l_rec, l_nc, l_dc = self(data)
-            loss.backward()
-            optimizer.step()
-            
-            # Update progress bar
-            bar.update(1)
-            bar.set_description(
-                f'Iter {iteration} | '
-                f'Loss: {loss.item():.3f} | '
-                f'Rec: {l_rec.item():.3f} | NC: {l_nc.item():.3f} | DC: {l_dc.item():.3f} | '
-                f'Leaves: {len(self.leaf_nodes)}'
-            )
-            iteration += 1
-    
+            if accumulation_steps is None:
+                desired_global_batch = 4096 if self.device.type == 'cuda' else max(data.size(0), 1024)
+                accumulation_steps = max(1, desired_global_batch // data.size(0))
+
+            with amp.autocast(enabled=self.device.type == 'cuda'):
+                loss, l_rec, l_nc, l_dc = self(data)
+
+            pending_losses['loss'] = loss.detach().item()
+            pending_losses['rec'] = l_rec.detach().item()
+            pending_losses['nc'] = l_nc.detach().item()
+            pending_losses['dc'] = l_dc.detach().item()
+
+            scaled_loss = loss / accumulation_steps
+            scaler.scale(scaled_loss).backward()
+            micro_step += 1
+
+            should_step = (micro_step % accumulation_steps == 0) or (iteration + 1 == iterations)
+            if should_step:
+                scaler.unscale_(optimizer)
+                trainable_params = [
+                    p for group in optimizer.param_groups for p in group['params'] if p.requires_grad
+                ]
+                if trainable_params:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+
+                loss_history.append(pending_losses['loss'])
+
+                bar.update(1)
+                bar.set_description(
+                    f'Iter {iteration} | '
+                    f'Loss: {pending_losses["loss"]:.3f} | '
+                    f'Rec: {pending_losses["rec"]:.3f} | NC: {pending_losses["nc"]:.3f} | '
+                    f'DC: {pending_losses["dc"]:.3f} | '
+                    f'Leaves: {len(self.leaf_nodes)}'
+                )
+                iteration += 1
+
+        
+        bar.close()
+        return loss_history
     def predict(self, data_loader: Iterable) -> torch.Tensor:
         """
         Assigns each data point from the data loader to a cluster (leaf node).
